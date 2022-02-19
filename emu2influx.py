@@ -1,11 +1,15 @@
+import argparse
 import logging
 import sys
+import time
 import os
+
 from datetime import datetime
 
 from influxdb import InfluxDBClient
 
-from emu import *
+import emu
+
 
 Y2K = 946684800
 int_max = 2**31 - 1
@@ -147,7 +151,7 @@ if __name__ == "__main__":
     influx.create_database(args.db)
 
     try:
-        main(client=emu(args.serial_port), db=influx)
+        main(client=emu.emu(args.serial_port), db=influx)
     except KeyboardInterrupt:
         try:
             sys.exit(0)
