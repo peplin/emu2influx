@@ -20,7 +20,7 @@ def get_timestamp(obj):
     # print obj.TimeStamp
     if obj.TimeStamp is None:
         obj.TimeStamp = "0x0"
-    return datetime.utcfromtimestamp(Y2K + int(obj.TimeStamp, 16)).isoformat()
+    return datetime.utcfromtimestamp(Y2K + int(obj.TimeStamp, 16))
 
 
 def get_reading(reading, obj):
@@ -40,9 +40,9 @@ def main(client, db):
     client.get_current_summation_delivered()
     client.get_price_blocks()
 
-    last_demand = 0
-    last_price = 0
-    last_reading = 0
+    last_demand_timestamp = None
+    last_price_timestamp = None
+    last_reading_timestamp = None
 
     while True:
         time.sleep(10)
@@ -50,7 +50,7 @@ def main(client, db):
         try:
             price_cluster = client.PriceCluster
             timestamp = get_timestamp(price_cluster)
-            if timestamp > last_price:
+            if last_price_timestamp is None or timestamp > last_price_timestamp:
                 measurement = [
                     {
                         "measurement": "price",
@@ -61,18 +61,18 @@ def main(client, db):
                 logging.debug(price_cluster)
                 logging.debug(measurement)
                 db.write_points(measurement, time_precision="s")
-                last_price = timestamp
+                last_price_timestamp = timestamp
         except AttributeError:
             pass
 
         try:
             instantaneous_demand = client.InstantaneousDemand
             timestamp = get_timestamp(instantaneous_demand)
-            if timestamp > last_demand:
+            if last_demand_timestamp is None or timestamp > last_demand_timestamp:
                 measurement = [
                     {
                         "measurement": "demand",
-                        "time": timestamp,
+                        "time": timestamp.isoformat(),
                         "fields": {
                             "demand": get_reading(
                                 instantaneous_demand.Demand, instantaneous_demand
@@ -83,18 +83,18 @@ def main(client, db):
                 logging.debug(instantaneous_demand)
                 logging.debug(measurement)
                 db.write_points(measurement, time_precision="s")
-                last_demand = timestamp
+                last_demand_timestamp = timestamp
         except AttributeError:
             pass
 
         try:
             current_summation_delivered = client.CurrentSummationDelivered
             timestamp = get_timestamp(current_summation_delivered)
-            if timestamp > last_reading:
+            if last_reading_timestamp is None or timestamp > last_reading_timestamp:
                 measurement = [
                     {
                         "measurement": "reading",
-                        "time": timestamp,
+                        "time": timestamp.isoformat(),
                         "fields": {
                             "reading": get_reading(
                                 current_summation_delivered.SummationDelivered,
@@ -106,7 +106,7 @@ def main(client, db):
                 logging.debug(current_summation_delivered)
                 logging.debug(measurement)
                 db.write_points(measurement, time_precision="s")
-                last_reading = timestamp
+                last_reading_timestamp = timestamp
         except AttributeError:
             pass
 
