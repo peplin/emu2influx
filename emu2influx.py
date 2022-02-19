@@ -99,7 +99,11 @@ def main(client, db):
                             "reading": get_reading(
                                 current_summation_delivered.SummationDelivered,
                                 current_summation_delivered,
-                            )
+                            ),
+                            "reading_received": get_reading(
+                                current_summation_delivered.SummationReceived,
+                                current_summation_delivered,
+                            ),
                         },
                     }
                 ]
