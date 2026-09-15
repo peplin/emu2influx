@@ -49,6 +49,19 @@ $ python -m unittest discover -p 'test_*.py'
 
 `test_emu.py` drives the serial client through a pty, so it needs no hardware.
 
+### Recovering from a stalled EMU
+
+The EMU sometimes stops pushing messages, and it comes back on a different
+`/dev/ttyACM*` node when it is replugged. When no new readings arrive,
+`emu2influx` escalates:
+
+* after `--nudge-after` seconds (120 by default), re-send the data requests
+* after `--reconnect-after` seconds (300), close the port, look the device up
+  again, and reopen it; this also happens immediately if the serial reader
+  fails, for example because the device was unplugged
+* after `--exit-after` seconds (900), exit nonzero so the supervisor or
+  container runtime restarts the process
+
 ### Docker
 
 ` $ docker run --device=/dev/ttyACM0 bakerba/emu2influx --host <influx_ip> ttyACM0`
