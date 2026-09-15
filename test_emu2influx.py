@@ -1,6 +1,9 @@
 import unittest
 
 from datetime import datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import mock
 from xml.etree.ElementTree import fromstring
 
 import emu2influx
@@ -66,6 +69,35 @@ class ParsingTest(unittest.TestCase):
         self.assertEqual(
             datetime(2018, 10, 8, 18, 15, 49), emu2influx.get_timestamp(summation)
         )
+
+
+class FindSerialPortTest(unittest.TestCase):
+    def test_prefers_earlier_glob(self):
+        with TemporaryDirectory() as directory:
+            by_id = Path(directory, "by-id-Rainforest")
+            by_id.touch()
+            Path(directory, "ttyACM0").touch()
+            globs = (str(Path(directory, "by-id-*")), str(Path(directory, "ttyACM*")))
+            with mock.patch.object(emu2influx, "DEFAULT_PORT_GLOBS", globs):
+                self.assertEqual(str(by_id), emu2influx.find_serial_port("auto"))
+
+    def test_discovers_renumbered_device(self):
+        with TemporaryDirectory() as directory:
+            Path(directory, "ttyACM3").touch()
+            globs = (str(Path(directory, "ttyACM*")),)
+            with mock.patch.object(emu2influx, "DEFAULT_PORT_GLOBS", globs):
+                self.assertEqual(
+                    str(Path(directory, "ttyACM3")), emu2influx.find_serial_port("auto")
+                )
+
+    def test_no_match(self):
+        with TemporaryDirectory() as directory:
+            globs = (str(Path(directory, "ttyACM*")),)
+            with mock.patch.object(emu2influx, "DEFAULT_PORT_GLOBS", globs):
+                self.assertIsNone(emu2influx.find_serial_port("auto"))
+
+    def test_explicit_port_is_qualified(self):
+        self.assertIsNone(emu2influx.find_serial_port("definitely_not_a_device"))
 
 
 if __name__ == "__main__":

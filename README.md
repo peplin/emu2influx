@@ -30,35 +30,34 @@ $ pip install -r requirements.txt
 
 ### Run
 
-`$ python emu2influx.py <emu2_serial_port>`
+`$ python emu2influx.py [emu2_serial_port]`
+
+The serial port is optional. Without it, or with `auto`, `emu2influx` finds the
+EMU by looking for `/dev/serial/by-id/*Rainforest*` and then `/dev/ttyACM*`
+(also under `/host/dev`, see Docker below). The argument may also be a path or a
+glob, e.g. `/dev/ttyACM1` or `'/dev/serial/by-id/*EMU*'`.
 
 By default `emu2influx` will connect to a local InfluxDB install, use the default credentials, and store data in a table named `rainforest`
 
+Run `emu2influx.py --help` for the full argument list.
+
+### Tests
+
 ```
-usage: emu2influx.py [-h] [--debug] [--host HOST] [--port PORT]
-                     [--username USERNAME] [--password PASSWORD] [--db DB]
-                     [--retries RETRIES]
-                     serial_port
+$ python -m unittest discover -p 'test_*.py'
+```
 
-positional arguments:
-  serial_port          Rainforest serial port, e.g. 'ttyACM0'
-
-optional arguments:
-  -h, --help           show this help message and exit
-  --debug              enable debug logging
-  --host HOST          influx host
-  --port PORT          influx port
-  --username USERNAME  influx username
-  --password PASSWORD  influx password
-  --db DB              influx database name
-  --retries RETRIES    influx retries
-``` 
+`test_emu.py` drives the serial client through a pty, so it needs no hardware.
 
 ### Docker
 
 ` $ docker run --device=/dev/ttyACM0 bakerba/emu2influx --host <influx_ip> ttyACM0`
 
-Example usage in `docker-compose.yml`
+A `devices` mapping is resolved once, when the container starts, so an EMU that
+comes back on a different `/dev/ttyACM*` node stays invisible to the container
+until it is recreated. To let the container find the device wherever it lands,
+bind-mount the host's `/dev` at `/host/dev` and allow the USB ACM character
+major number (166) instead:
 
 ```
 version: '3.3'
@@ -68,11 +67,16 @@ services:
     image: bakerba/emu2influx
     container_name: emu2influx
     network_mode: host
-    devices:
-      - /dev/ttyACM0:/dev/ttyACM0
+    volumes:
+      - /dev:/host/dev
+    device_cgroup_rules:
+      - 'c 166:* rmw'
     restart: unless-stopped
-    command: '--host <influx_ip> ttyACM0'
+    command: '--host <influx_ip>'
 ```
+
+`device_cgroup_rules` needs docker-compose 1.28 or newer; on older versions use
+`privileged: true` with the same bind mount.
 
 ### What next?
 
