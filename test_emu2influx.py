@@ -125,6 +125,28 @@ class ParsingTest(unittest.TestCase):
         )
 
 
+class WaitForInfluxTest(unittest.TestCase):
+    def setUp(self):
+        self.clock = FakeClock()
+        clock_patch = mock.patch.object(emu2influx, "time", self.clock)
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
+
+    def test_retries_until_influx_is_up(self):
+        db = FakeInflux()
+        create = mock.Mock(side_effect=[IOError("refused"), IOError("refused"), None])
+        db.create_database = create
+        self.assertTrue(emu2influx.wait_for_influx(db, "rainforest", attempts=5))
+        self.assertEqual(3, create.call_count)
+
+    def test_gives_up_eventually(self):
+        db = FakeInflux()
+        db.create_database = mock.Mock(side_effect=IOError("refused"))
+        with self.assertRaises(IOError):
+            emu2influx.wait_for_influx(db, "rainforest", attempts=3)
+        self.assertEqual(3, db.create_database.call_count)
+
+
 class FindSerialPortTest(unittest.TestCase):
     def test_prefers_earlier_glob(self):
         with TemporaryDirectory() as directory:
@@ -178,6 +200,19 @@ class WriteNewPointsTest(unittest.TestCase):
         last_timestamps = {}
         emu2influx.write_new_points(self.client, self.db, last_timestamps)
         self.assertFalse(
+            emu2influx.write_new_points(self.client, self.db, last_timestamps)
+        )
+        self.assertEqual(1, len(self.db.points))
+
+    def test_influx_failure_is_retried(self):
+        last_timestamps = {}
+        with mock.patch.object(self.db, "write_points", side_effect=IOError("down")):
+            self.assertTrue(
+                emu2influx.write_new_points(self.client, self.db, last_timestamps)
+            )
+        self.assertEqual({}, last_timestamps)
+
+        self.assertTrue(
             emu2influx.write_new_points(self.client, self.db, last_timestamps)
         )
         self.assertEqual(1, len(self.db.points))
