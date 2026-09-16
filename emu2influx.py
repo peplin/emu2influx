@@ -71,6 +71,21 @@ MEASUREMENTS = (
 )
 
 
+def wait_for_influx(db, database, attempts=30, interval=POLL_INTERVAL):
+    """Create the database, tolerating an InfluxDB that is still starting up."""
+    for attempt in range(1, attempts + 1):
+        try:
+            db.create_database(database)
+            return True
+        except Exception:
+            logging.warning(
+                "InfluxDB is not ready yet (attempt %d of %d)", attempt, attempts
+            )
+            if attempt == attempts:
+                raise
+            time.sleep(interval)
+
+
 def find_serial_port(port_spec):
     """Return a serial device path, or None if nothing matches.
 
@@ -158,7 +173,8 @@ def disconnect(client):
 def write_new_points(client, db, last_timestamps):
     """Write any readings newer than the last ones seen.
 
-    Returns True if the EMU reported anything new.
+    Returns True if the EMU reported anything new, whether or not the InfluxDB
+    write succeeded.
     """
     fresh = False
     for measurement, attribute, build_fields in MEASUREMENTS:
@@ -184,7 +200,13 @@ def write_new_points(client, db, last_timestamps):
             "fields": fields,
         }
         logging.debug(point)
-        db.write_points([point], time_precision="s")
+        try:
+            db.write_points([point], time_precision="s")
+        except Exception:
+            # Leave last_timestamps alone so the point is retried next cycle.
+            logging.warning("Failed to write %s to InfluxDB", measurement,
+                            exc_info=True)
+            continue
         last_timestamps[measurement] = timestamp
     return fresh
 
@@ -309,7 +331,7 @@ if __name__ == "__main__":
         password=args.password,
         retries=args.retries,
     )
-    influx.create_database(args.db)
+    wait_for_influx(influx, args.db)
 
     try:
         sys.exit(
