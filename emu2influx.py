@@ -1,4 +1,5 @@
 import argparse
+import glob
 import logging
 import sys
 import time
@@ -14,6 +15,19 @@ import emu
 Y2K = 946684800
 int_max = 2**31 - 1
 uint_max = 2**32 - 1
+
+# Not every host has udev's stable /dev/serial/by-id symlinks, so fall back to
+# globbing the CDC ACM devices. /host/dev is where a container can bind-mount
+# the host's /dev, which is what makes a re-enumerated device visible without a
+# container restart.
+DEFAULT_PORT_GLOBS = (
+    "/dev/serial/by-id/*Rainforest*",
+    "/host/dev/serial/by-id/*Rainforest*",
+    "/dev/ttyACM*",
+    "/host/dev/ttyACM*",
+)
+
+POLL_INTERVAL = 10
 
 
 def get_timestamp(obj):
@@ -34,6 +48,47 @@ def get_price(obj):
     return int(obj.Price, 16) / float(10 ** int(obj.TrailingDigits, 16))
 
 
+def find_serial_port(port_spec):
+    """Return a serial device path, or None if nothing matches.
+
+    A spec of "auto" searches DEFAULT_PORT_GLOBS. Anything else is used
+    directly, and may itself be a glob.
+    """
+    if port_spec == "auto":
+        patterns = DEFAULT_PORT_GLOBS
+    else:
+        if not port_spec.startswith("/"):
+            port_spec = "/dev/" + port_spec
+        patterns = (port_spec,)
+
+    for pattern in patterns:
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            if len(matches) > 1:
+                logging.warning(
+                    "Multiple serial ports match %s: %s, using %s",
+                    pattern,
+                    matches,
+                    matches[0],
+                )
+            return matches[0]
+    return None
+
+
+def wait_for_serial_port(port_spec, interval=POLL_INTERVAL):
+    """Block until a serial device matching port_spec shows up."""
+    logged = False
+    while True:
+        port = find_serial_port(port_spec)
+        if port is not None:
+            return port
+        if not logged:
+            logging.warning("No serial port matches %s, waiting for it to appear",
+                            port_spec)
+            logged = True
+        time.sleep(interval)
+
+
 def main(client, db):
     client.start_serial()
     client.get_instantaneous_demand("Y")
@@ -45,7 +100,7 @@ def main(client, db):
     last_reading_timestamp = None
 
     while True:
-        time.sleep(10)
+        time.sleep(POLL_INTERVAL)
 
         try:
             price_cluster = client.PriceCluster
@@ -134,7 +189,12 @@ def parse_args():
         "--db", help="influx database name", required=False, default="rainforest"
     )
     parser.add_argument("--retries", help="influx retries", required=False, default=3)
-    parser.add_argument("serial_port", help="Rainforest serial port, e.g. 'ttyACM0'")
+    parser.add_argument(
+        "serial_port",
+        nargs="?",
+        default="auto",
+        help="Rainforest serial port, e.g. 'ttyACM0', or 'auto' to discover it",
+    )
     return parser.parse_args()
 
 
@@ -155,7 +215,7 @@ if __name__ == "__main__":
     influx.create_database(args.db)
 
     try:
-        main(client=emu.emu(args.serial_port), db=influx)
+        main(client=emu.emu(wait_for_serial_port(args.serial_port)), db=influx)
     except KeyboardInterrupt:
         try:
             sys.exit(0)
