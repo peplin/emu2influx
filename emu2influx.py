@@ -1,9 +1,9 @@
 import argparse
 import glob
 import logging
+import os
 import sys
 import time
-import os
 
 from datetime import datetime
 
@@ -17,8 +17,8 @@ int_max = 2**31 - 1
 uint_max = 2**32 - 1
 
 # Not every host has udev's stable /dev/serial/by-id symlinks, so fall back to
-# globbing the CDC ACM devices. /host/dev is where a container can bind-mount
-# the host's /dev, which is what makes a re-enumerated device visible without a
+# globbing the CDC ACM devices. /host/dev is where the container bind-mounts the
+# host's /dev, which is what makes a re-enumerated device visible without a
 # container restart.
 DEFAULT_PORT_GLOBS = (
     "/dev/serial/by-id/*Rainforest*",
@@ -48,6 +48,29 @@ def get_price(obj):
     return int(obj.Price, 16) / float(10 ** int(obj.TrailingDigits, 16))
 
 
+def price_fields(obj):
+    return {"price": get_price(obj)}
+
+
+def demand_fields(obj):
+    return {"demand": get_reading(obj.Demand, obj)}
+
+
+def reading_fields(obj):
+    return {
+        "reading": get_reading(obj.SummationDelivered, obj),
+        "reading_received": get_reading(obj.SummationReceived, obj),
+    }
+
+
+# (InfluxDB measurement, attribute set on the emu client, field builder)
+MEASUREMENTS = (
+    ("price", "PriceCluster", price_fields),
+    ("demand", "InstantaneousDemand", demand_fields),
+    ("reading", "CurrentSummationDelivered", reading_fields),
+)
+
+
 def find_serial_port(port_spec):
     """Return a serial device path, or None if nothing matches.
 
@@ -75,8 +98,9 @@ def find_serial_port(port_spec):
     return None
 
 
-def wait_for_serial_port(port_spec, interval=POLL_INTERVAL):
-    """Block until a serial device matching port_spec shows up."""
+def wait_for_serial_port(port_spec, timeout, interval=POLL_INTERVAL):
+    """Return a matching serial device path, or None if none appears in time."""
+    deadline = time.monotonic() + timeout
     logged = False
     while True:
         port = find_serial_port(port_spec)
@@ -86,88 +110,143 @@ def wait_for_serial_port(port_spec, interval=POLL_INTERVAL):
             logging.warning("No serial port matches %s, waiting for it to appear",
                             port_spec)
             logged = True
+        if time.monotonic() >= deadline:
+            return None
         time.sleep(interval)
 
 
-def main(client, db):
-    client.start_serial()
+def request_updates(client):
     client.get_instantaneous_demand("Y")
     client.get_current_summation_delivered()
     client.get_price_blocks()
 
-    last_demand_timestamp = None
-    last_price_timestamp = None
-    last_reading_timestamp = None
+
+def connect(port_spec, discover_timeout=60, connect_timeout=30):
+    """Open the EMU serial port, returning a started client.
+
+    Returns None if the port did not come up, so the caller can retry.
+    """
+    port = wait_for_serial_port(port_spec, discover_timeout)
+    if port is None:
+        return None
+    client = emu.emu(port)
+    client.start_serial()
+
+    deadline = time.monotonic() + connect_timeout
+    while time.monotonic() < deadline:
+        if client.serial_connected:
+            logging.info("Connected to the EMU on %s", port)
+            request_updates(client)
+            return client
+        if not client.thread_handle.is_alive():
+            logging.error("Could not open %s: %s", port, client.serial_error)
+            return None
+        time.sleep(1)
+
+    logging.error("Timed out opening %s", port)
+    disconnect(client)
+    return None
+
+
+def disconnect(client):
+    if client is None:
+        return
+    client.stop_serial()
+    client.thread_handle.join(timeout=30)
+
+
+def write_new_points(client, db, last_timestamps):
+    """Write any readings newer than the last ones seen.
+
+    Returns True if the EMU reported anything new.
+    """
+    fresh = False
+    for measurement, attribute, build_fields in MEASUREMENTS:
+        obj = getattr(client, attribute, None)
+        if obj is None:
+            continue
+
+        try:
+            timestamp = get_timestamp(obj)
+            fields = build_fields(obj)
+        except (AttributeError, TypeError, ValueError):
+            logging.warning("Skipping malformed %s message", attribute, exc_info=True)
+            continue
+
+        last_timestamp = last_timestamps.get(measurement)
+        if last_timestamp is not None and timestamp <= last_timestamp:
+            continue
+        fresh = True
+
+        point = {
+            "measurement": measurement,
+            "time": timestamp.isoformat(),
+            "fields": fields,
+        }
+        logging.debug(point)
+        db.write_points([point], time_precision="s")
+        last_timestamps[measurement] = timestamp
+    return fresh
+
+
+def main(port_spec, db, nudge_after, reconnect_after, exit_after):
+    """Poll the EMU forever, escalating through recovery steps when it goes quiet.
+
+    The EMU sometimes stops pushing messages, and sometimes re-enumerates under
+    a different device node. So when no new readings arrive, first re-send the
+    requests, then reopen the (re-discovered) serial port, and finally exit
+    nonzero so the container is restarted.
+    """
+    last_timestamps = {}
+    client = None
+    last_fresh_data = time.monotonic()
+    last_nudge = last_fresh_data
+    last_reconnect = last_fresh_data
 
     while True:
+        if client is None:
+            client = connect(port_spec, discover_timeout=reconnect_after)
+            last_reconnect = time.monotonic()
+            if client is None:
+                time.sleep(POLL_INTERVAL)
+                continue
+            last_nudge = last_reconnect
+
         time.sleep(POLL_INTERVAL)
 
-        try:
-            price_cluster = client.PriceCluster
-            timestamp = get_timestamp(price_cluster)
-            if last_price_timestamp is None or timestamp > last_price_timestamp:
-                measurement = [
-                    {
-                        "measurement": "price",
-                        "time": timestamp,
-                        "fields": {"price": get_price(price_cluster)},
-                    }
-                ]
-                logging.debug(price_cluster)
-                logging.debug(measurement)
-                db.write_points(measurement, time_precision="s")
-                last_price_timestamp = timestamp
-        except AttributeError:
-            pass
+        now = time.monotonic()
+        if write_new_points(client, db, last_timestamps):
+            last_fresh_data = now
+            continue
 
-        try:
-            instantaneous_demand = client.InstantaneousDemand
-            timestamp = get_timestamp(instantaneous_demand)
-            if last_demand_timestamp is None or timestamp > last_demand_timestamp:
-                measurement = [
-                    {
-                        "measurement": "demand",
-                        "time": timestamp.isoformat(),
-                        "fields": {
-                            "demand": get_reading(
-                                instantaneous_demand.Demand, instantaneous_demand
-                            )
-                        },
-                    }
-                ]
-                logging.debug(instantaneous_demand)
-                logging.debug(measurement)
-                db.write_points(measurement, time_precision="s")
-                last_demand_timestamp = timestamp
-        except AttributeError:
-            pass
+        quiet_for = now - last_fresh_data
+        if quiet_for > exit_after:
+            logging.error(
+                "No data from the EMU for %.0fs, exiting so the service restarts",
+                quiet_for,
+            )
+            disconnect(client)
+            return 1
 
-        try:
-            current_summation_delivered = client.CurrentSummationDelivered
-            timestamp = get_timestamp(current_summation_delivered)
-            if last_reading_timestamp is None or timestamp > last_reading_timestamp:
-                measurement = [
-                    {
-                        "measurement": "reading",
-                        "time": timestamp.isoformat(),
-                        "fields": {
-                            "reading": get_reading(
-                                current_summation_delivered.SummationDelivered,
-                                current_summation_delivered,
-                            ),
-                            "reading_received": get_reading(
-                                current_summation_delivered.SummationReceived,
-                                current_summation_delivered,
-                            ),
-                        },
-                    }
-                ]
-                logging.debug(current_summation_delivered)
-                logging.debug(measurement)
-                db.write_points(measurement, time_precision="s")
-                last_reading_timestamp = timestamp
-        except AttributeError:
-            pass
+        serial_dead = not client.thread_handle.is_alive()
+        reconnect_due = (
+            quiet_for > reconnect_after and now - last_reconnect > reconnect_after
+        )
+        if serial_dead or reconnect_due:
+            logging.warning(
+                "Reconnecting to the EMU (quiet for %.0fs, serial error: %s)",
+                quiet_for,
+                client.serial_error,
+            )
+            disconnect(client)
+            client = None
+            continue
+
+        if quiet_for > nudge_after and now - last_nudge > nudge_after:
+            logging.warning("No new data for %.0fs, re-requesting updates",
+                            quiet_for)
+            request_updates(client)
+            last_nudge = now
 
 
 def parse_args():
@@ -190,6 +269,24 @@ def parse_args():
     )
     parser.add_argument("--retries", help="influx retries", required=False, default=3)
     parser.add_argument(
+        "--nudge-after",
+        type=float,
+        default=120,
+        help="seconds without new data before re-requesting updates",
+    )
+    parser.add_argument(
+        "--reconnect-after",
+        type=float,
+        default=300,
+        help="seconds without new data before reopening the serial port",
+    )
+    parser.add_argument(
+        "--exit-after",
+        type=float,
+        default=900,
+        help="seconds without new data before exiting nonzero",
+    )
+    parser.add_argument(
         "serial_port",
         nargs="?",
         default="auto",
@@ -201,7 +298,7 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     logging.basicConfig(
-        level=("DEBUG" if args.debug else "WARN"),
+        level=("DEBUG" if args.debug else "INFO"),
         format="%(asctime)s:%(levelname)s:%(name)s: %(message)s",
     )
     influx = InfluxDBClient(
@@ -215,7 +312,15 @@ if __name__ == "__main__":
     influx.create_database(args.db)
 
     try:
-        main(client=emu.emu(wait_for_serial_port(args.serial_port)), db=influx)
+        sys.exit(
+            main(
+                port_spec=args.serial_port,
+                db=influx,
+                nudge_after=args.nudge_after,
+                reconnect_after=args.reconnect_after,
+                exit_after=args.exit_after,
+            )
+        )
     except KeyboardInterrupt:
         try:
             sys.exit(0)
